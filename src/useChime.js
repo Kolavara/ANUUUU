@@ -1,4 +1,4 @@
-import { useRef, useCallback } from 'react';
+import { useRef, useCallback, useEffect } from 'react';
 
 function createReverb(ctx, duration = 2.5, decay = 2.0) {
   const length = ctx.sampleRate * duration;
@@ -12,6 +12,23 @@ function createReverb(ctx, duration = 2.5, decay = 2.0) {
   const convolver = ctx.createConvolver();
   convolver.buffer = impulse;
   return convolver;
+}
+
+/**
+ * iOS Safari requires playing a silent buffer inside a user gesture
+ * to fully unlock the AudioContext. Without this, resume() called
+ * outside a gesture handler silently fails.
+ */
+function unlockOnMobile(ctx) {
+  try {
+    const buffer = ctx.createBuffer(1, 1, 22050);
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
+    source.start(0);
+  } catch (_) {
+    // ignore
+  }
 }
 
 function playNote(ctx, reverb, masterGain, freq, startTime, duration, gainPeak = 0.18, pan = 0) {
@@ -53,13 +70,29 @@ function playNote(ctx, reverb, masterGain, freq, startTime, duration, gainPeak =
 export function useChime() {
   const ctxRef = useRef(null);
 
+  // Listen for visibility changes — some mobile browsers suspend
+  // AudioContext when the tab goes to background and never resume it.
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === 'visible' && ctxRef.current && ctxRef.current.state === 'suspended') {
+        ctxRef.current.resume().catch(() => {});
+      }
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, []);
+
   const playReveal = useCallback(() => {
     try {
       if (!ctxRef.current || ctxRef.current.state === 'closed') {
         ctxRef.current = new (window.AudioContext || window.webkitAudioContext)();
       }
       const ctx = ctxRef.current;
-      if (ctx.state === 'suspended') ctx.resume();
+      // If unlocked by a user gesture, try to resume; if not unlocked,
+      // we'll still attempt it — some Android browsers are lenient.
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
 
       const now = ctx.currentTime;
       const master = ctx.createGain();
@@ -95,7 +128,15 @@ export function useChime() {
       if (!ctxRef.current) {
         ctxRef.current = new (window.AudioContext || window.webkitAudioContext)();
       }
-      if (ctxRef.current.state === 'suspended') ctxRef.current.resume();
+      if (ctxRef.current.state === 'suspended') {
+        ctxRef.current.resume().then(() => {
+          // Play a silent buffer to fully unlock on iOS Safari
+          unlockOnMobile(ctxRef.current);
+        }).catch(() => {});
+      } else {
+        // Already running — still play silent buffer for iOS
+        unlockOnMobile(ctxRef.current);
+      }
     } catch (e) {}
   }, []);
 
